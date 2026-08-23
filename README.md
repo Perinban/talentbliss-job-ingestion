@@ -1,78 +1,95 @@
-# TalentBliss job-data processing
+# TalentBliss Job Ingestion
 
-This repository is the final stage of the existing TalentBliss job pipeline:
+Validated, resumable ingestion pipeline that prepares job feeds and publishes them to the TalentBliss API in safe, idempotent batches.
 
-1. `Perinban/join_companies` refreshes the JOIN company catalog.
-2. `Perinban/WebScrapJobs` scrapes JOIN jobs, combines `job_summary.json`, and uploads it to Google Drive.
-3. This repository downloads the latest Drive feed, validates it, removes scraper failures and duplicate URLs, then imports the complete validated feed through the TalentBliss Oracle API.
+## Overview
 
-The TalentBliss API performs the PostgreSQL transaction, company upserts, job upserts, idempotency checks, deletion of jobs missing from a successfully finalized complete feed, and cleanup of imported companies that no longer have jobs. This repository does not truncate tables, write directly to PostgreSQL, or use Supabase at runtime.
+This repository is the ingestion stage between the job-scraping workflow and the TalentBliss platform. It downloads the latest feed from Google Drive or accepts a local JSON file, validates and deduplicates records, and publishes the complete dataset through the TalentBliss import API.
 
-## Safety behavior
+The pipeline is intentionally fail-safe: incomplete uploads cannot finalize and therefore cannot remove the existing production job set.
 
-The loader fails before finalization when:
-
-- the Drive feed cannot be found or downloaded;
-- the downloaded size or checksum does not match Drive metadata;
-- the TalentBliss health endpoint is unavailable or not healthy;
-- the import token or API URL is missing;
-- any API batch fails or returns inconsistent counts; or
-- finalization does not acknowledge the complete job count.
-
-Jobs missing from the new feed are only deleted by the TalentBliss finalize endpoint after every expected batch has completed. A partial upload cannot finalize and therefore cannot delete the existing job set.
-
-Imports flow through a producer-consumer queue. Each API request respects the server contract of at most 5,000 jobs and a byte target, but there is no limit on the total feed. Transient batch failures are retried independently, and downloaded Drive feeds use a stable file-derived run identity so reruns can reuse completed server-side batches instead of restarting the import.
-
-## Required GitHub configuration
-
-Repository secrets:
+## Pipeline
 
 ```text
-GOOGLE_API_KEY
-GDRIVE_FOLDER_ID
-PIPELINE_IMPORT_TOKEN
+job sources
+   ↓
+job-scraping-pipeline
+   ↓
+validated JSON feed / Google Drive
+   ↓
+talentbliss-job-ingestion
+   ↓
+TalentBliss import API
+   ↓
+PostgreSQL
 ```
 
-When using the private Oracle staging endpoint through SSH, also configure:
+## Key features
+
+- Google Drive feed discovery and integrity checks
+- Local-file dry-run support
+- Validation and duplicate-URL removal
+- Stable run IDs for resumable/idempotent imports
+- Producer-consumer batch publishing
+- Configurable byte and record limits per request
+- Independent retry handling for transient failures
+- Finalization only after all expected batches succeed
+- Unit tests for download, validation, and import behavior
+
+## Tech stack
+
+- Python
+- Google Drive API
+- Requests
+- GitHub Actions
+- TalentBliss HTTP import API
+
+## Repository structure
 
 ```text
-ORACLE_SSH_PRIVATE_KEY
-DEPLOY_KNOWN_HOSTS
+.
+├── main.py                 # CLI entry point and pipeline orchestration
+├── filedownload.py         # Google Drive discovery/download logic
+├── oracle_import.py        # Validation, batching, and API publishing
+├── tests/                  # Unit tests
+├── .github/workflows/      # Scheduled/manual automation
+├── requirements.txt
+└── README.md
 ```
 
-Repository variables:
-
-```text
-ENABLE_ORACLE_IMPORT=false
-USE_ORACLE_SSH_TUNNEL=true
-ORACLE_HOST=80.225.207.43
-ORACLE_USER=ubuntu
-ORACLE_STAGING_PORT=3100
-```
-
-Keep `ENABLE_ORACLE_IMPORT=false` until one confirmed `workflow_dispatch` import has succeeded. For a future public API route, set `USE_ORACLE_SSH_TUNNEL=false` and configure `TALENTBLISS_API_URL` instead.
-
-## Schedule
-
-The scraper is configured for `1 0 * * *` UTC, although GitHub has recently delayed its actual starts by several hours. The loader is scheduled for:
-
-```text
-17 9 * * *
-```
-
-That is 09:17 UTC daily, 11:17 in Europe/Berlin during CEST, and 10:17 during CET. The delay is based on observed scraper completion times rather than the nominal scraper cron.
-
-Scheduled imports run only when `ENABLE_ORACLE_IMPORT=true`. Pull requests and pushes to `main` run validation only. A manual workflow run performs an import only when the `confirm_import` input is explicitly selected.
-
-## Local validation
+## Local setup
 
 ```bash
-python -m pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python main.py --help
+```
+
+Validate a local feed without publishing it:
+
+```bash
+JOB_DATA_FILE=/path/to/job_summary.json DRY_RUN=true python main.py
+```
+
+## Configuration
+
+For Google Drive ingestion, configure the relevant Drive credentials/IDs. Publishing requires a TalentBliss API URL and import token. Oracle SSH-tunnel variables are only needed when the staging API is reached through the private server path.
+
+Never commit secrets. Keep production import enablement disabled until a manual run has been verified successfully.
+
+## Safety model
+
+The loader aborts before finalization when the feed cannot be downloaded or validated, the API is unhealthy, credentials are missing, a batch fails permanently, response counts are inconsistent, or finalization does not acknowledge the complete job count.
+
+Jobs absent from a new feed are deleted only by the server-side finalize operation after all expected batches have completed successfully.
+
+## Verification
+
+```bash
 python -m pip check
 python -m unittest discover -s tests -v
 python -m compileall -q .
 python main.py --help
-JOB_DATA_FILE=/path/to/job_summary.json DRY_RUN=true python main.py
 ```
-
-A local non-dry import also requires a stable `IMPORT_RUN_ID`, `TALENTBLISS_API_URL`, and `PIPELINE_IMPORT_TOKEN`. Google Drive imports derive the run ID from the Drive file ID and modification timestamp automatically.
